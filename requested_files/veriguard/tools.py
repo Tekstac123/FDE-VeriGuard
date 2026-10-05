@@ -113,10 +113,73 @@ def detect_typologies(alert_id: str) -> dict:
     Returns {"alert_id", "customer_id", "typologies": [{"typology", "evidence_txn_ids", "confidence", "summary"}]};
     an unknown alert returns {"alert_id", "error": "unknown alert"}. Add indicator_typologies(...) at the end.
     """
-    # TODO [W2-T1.1] review_transactions, ts, high_risk_jurisdictions and related_parties give you the data; the four
-    #       scored typologies and their thresholds are in the problem statement (structuring, layering, mule,
-    #       round_tripping).
-    raise NotImplementedError("detect_typologies is not yet implemented")
+    alert = get_alert(alert_id)
+    if not alert:
+        return {"alert_id": alert_id, "error": "unknown alert"}
+    rows = review_transactions(alert)
+    customer = get_customer(alert["customer_id"]) or {}
+    found = []
+
+    def add(name, evidence, summary, confidence="High"):
+        found.append({"typology": name, "evidence_txn_ids": evidence, "confidence": confidence, "summary": summary})
+
+    near = [r for r in rows if r["channel"] == "CASH_DEPOSIT" and 0.9 * CTR_THRESHOLD <= r["amount_inr"] < CTR_THRESHOLD]
+    best: list[dict] = []
+    for i, first in enumerate(near):
+        window = [r for r in near[i:] if ts(r) - ts(first) <= _dt.timedelta(days=10)]
+        if len(window) > len(best):
+            best = window
+    if len(best) >= 3 and len({r["branch_code"] for r in best}) >= 3:
+        add("structuring", [r["txn_id"] for r in best],
+            f"{len(best)} cash deposits of Rs 9-10 lakh across {len({r['branch_code'] for r in best})} branches "
+            f"within 10 days, each just below the Rs 10 lakh CTR threshold")
+
+    hrj = high_risk_jurisdictions()
+    swift = [r for r in rows if r["channel"] in ("SWIFT_IN", "SWIFT_OUT") and r["counterparty_country"] in hrj]
+    if swift:
+        add("layering", [r["txn_id"] for r in swift],
+            f"{len(swift)} SWIFT transfer(s) with {', '.join(sorted({hrj[r['counterparty_country']] for r in swift}))} "
+            f"(High-Risk Jurisdiction Register)")
+
+    inbound = [r for r in rows if r["channel"] in ("UPI", "IMPS") and r["direction"] == "CR"]
+    mule = None
+    for i, first in enumerate(inbound):
+        window = [r for r in inbound[i:] if ts(r) - ts(first) <= _dt.timedelta(days=7)]
+        if len({r["counterparty_name"] for r in window}) >= 25:
+            credited = sum(r["amount_inr"] for r in window)
+            out = [r for r in rows if r["direction"] == "DR" and ts(first) <= ts(r) <= ts(window[-1]) + _dt.timedelta(hours=24)]
+            if sum(r["amount_inr"] for r in out) >= 0.8 * credited:
+                mule = ([r["txn_id"] for r in window + out],
+                        f"{len({r['counterparty_name'] for r in window})} distinct UPI/IMPS senders in 7 days, "
+                        f"{sum(r['amount_inr'] for r in out) / credited:.0%} sent out within 24 hours (DCB-CC-2026-07)")
+                break
+    if mule is None:
+        cycles = []
+        for c in (r for r in inbound if r["amount_inr"] >= 100_000):
+            out = [r for r in rows if r["direction"] == "DR" and r["channel"] in ("UPI", "IMPS")
+                   and _dt.timedelta(0) < ts(r) - ts(c) <= _dt.timedelta(hours=24) and r["amount_inr"] >= 0.8 * c["amount_inr"]]
+            if out:
+                cycles += [c["txn_id"], out[0]["txn_id"]]
+        if len(cycles) >= 4:
+            mule = (cycles, f"{len(cycles) // 2} pass-through cycles: credit followed by ≥ 80% out within 24 hours")
+    if mule:
+        add("mule", *mule)
+
+    rel = related_parties(customer)
+    if rel:
+        evidence = []
+        for o in (r for r in rows if r["direction"] == "DR" and normalise_name(r["counterparty_name"]) in rel):
+            back = [r for r in rows if r["direction"] == "CR" and normalise_name(r["counterparty_name"]) in rel
+                    and _dt.timedelta(0) < ts(r) - ts(o) <= _dt.timedelta(days=30)
+                    and 0.9 * o["amount_inr"] <= r["amount_inr"] <= o["amount_inr"]]
+            if back:
+                evidence += [o["txn_id"], back[0]["txn_id"]]
+        if len(evidence) >= 4:
+            add("round_tripping", evidence, f"{len(evidence) // 2} cycles out to and ~90-100% back from related parties "
+                                            f"sharing a director within 30 days")
+
+    found += indicator_typologies(alert, customer)
+    return {"alert_id": alert_id, "customer_id": alert["customer_id"], "typologies": found}
 
 
 def screen_customer(customer_id: str) -> dict:
@@ -125,8 +188,30 @@ def screen_customer(customer_id: str) -> dict:
     Returns {"customer_id", "status": "no_match" | "cleared" | "unresolved" | "confirmed", "entity_id",
              "similarity", "differing_identifiers"}.
     """
-    # TODO [W2-T1.2] watchlist() and name_similarity (names and aliases). DCB-PRC-SCR §2–3 decide confirmed vs cleared.
-    raise NotImplementedError("screen_customer is not yet implemented")
+    c = get_customer(customer_id)
+    if not c:
+        return {"customer_id": customer_id, "error": "unknown customer"}
+    best = None
+    for w in watchlist():
+        for name in [w["name"]] + [a for a in (w["aliases"] or "").split(";") if a.strip()]:
+            score = name_similarity(c["full_name"], name)
+            if score >= 0.85 and (best is None or score > best[0]):
+                best = (score, w)
+    if best is None:
+        return {"customer_id": customer_id, "status": "no_match", "entity_id": None, "similarity": None,
+                "differing_identifiers": []}
+    score, w = best
+    differing = [k for k, mine, theirs in (("date_of_birth", c["date_of_birth"], w["date_of_birth"]),
+                                           ("nationality", c["nationality"], w["nationality"]))
+                 if mine and theirs and mine != theirs]
+    if score == 1.0 and c["date_of_birth"] == w["date_of_birth"]:
+        status = "confirmed"
+    elif len(differing) >= 2:
+        status = "cleared"
+    else:
+        status = "unresolved"
+    return {"customer_id": customer_id, "status": status, "entity_id": w["entity_id"], "similarity": score,
+            "differing_identifiers": differing}
 
 
 def compute_risk_score(alert_id: str) -> dict:
@@ -135,13 +220,62 @@ def compute_risk_score(alert_id: str) -> dict:
     Returns {"alert_id", "customer_id", "score", "band", "factors": [{"factor", "points", "evidence"}],
              "typologies", "screening"}.
     """
-    # TODO [W2-T1.3] POINTS holds every factor's points; velocity_anomaly, adverse_media_names and legit_explanation supply
-    #       evidence. Typology points: 20 per distinct SCORED typology, maximum 40.
-    raise NotImplementedError("compute_risk_score is not yet implemented")
+    alert = get_alert(alert_id)
+    if not alert:
+        return {"alert_id": alert_id, "error": "unknown alert"}
+    c = get_customer(alert["customer_id"])
+    rows = review_transactions(alert)
+    factors = [{"factor": f"kyc_{c['risk_category']}", "points": POINTS[f"kyc_{c['risk_category']}"],
+                "evidence": f"KYC risk category {c['risk_category']}"}]
+    if c["pep_flag"] == "Y":
+        factors.append({"factor": "pep", "points": POINTS["pep"], "evidence": "customer is a PEP or PEP associate"})
+    screening = screen_customer(c["customer_id"])
+    if screening["status"] == "confirmed":
+        factors.append({"factor": "watchlist_confirmed", "points": POINTS["watchlist_confirmed"],
+                        "evidence": f"confirmed match {screening['entity_id']}"})
+    elif screening["status"] == "unresolved":
+        factors.append({"factor": "watchlist_unresolved", "points": POINTS["watchlist_unresolved"],
+                        "evidence": f"unresolved potential match {screening['entity_id']} ({screening['similarity']})"})
+    hrj = high_risk_jurisdictions()
+    exposure = [r["txn_id"] for r in rows if r["counterparty_country"] in hrj]
+    if exposure:
+        factors.append({"factor": "hrj_exposure", "points": POINTS["hrj_exposure"],
+                        "evidence": f"{len(exposure)} transaction(s) with high-risk jurisdictions"})
+    velocity = velocity_anomaly(alert)
+    if velocity["anomaly"]:
+        factors.append({"factor": "velocity_anomaly", "points": POINTS["velocity_anomaly"],
+                        "evidence": f"30-day turnover Rs {velocity['turnover_30d']:,.0f} > 3 x baseline "
+                                    f"Rs {velocity['baseline_monthly']:,.0f}"})
+    typologies = detect_typologies(alert_id)["typologies"]
+    for t in [t for t in typologies if t["typology"] in SCORED_TYPOLOGIES][:2]:
+        factors.append({"factor": f"typology:{t['typology']}", "points": POINTS["typology"], "evidence": t["summary"]})
+    names = adverse_media_names()
+    if normalise_name(c["full_name"]) in names or any(r["direction"] == "CR" and normalise_name(r["counterparty_name"])
+                                                      in names for r in rows):
+        factors.append({"factor": "adverse_media", "points": POINTS["adverse_media"],
+                        "evidence": "adverse media on the customer or a remitter"})
+    explanation = legit_explanation(c)
+    if explanation:
+        factors.append({"factor": "legit_explanation_verified", "points": POINTS["legit_explanation_verified"],
+                        "evidence": explanation})
+    score = max(0, min(100, sum(f["points"] for f in factors)))
+    return {"alert_id": alert_id, "customer_id": c["customer_id"], "score": score, "band": band_of(score),
+            "factors": factors, "typologies": typologies, "screening": screening}
 
 
 def call_tool(name: str, arguments_json: str) -> dict:
     """The MCP tool boundary: JSON arguments validated against TOOL_SCHEMAS, then the tool runs. Never raises."""
-    # TODO [W2-T1.4] validate_json checks arguments against a tool's schema; the tool is the module-level function of the
-    #       same name. Every failure must come back as {"error": ...} an agent can act on.
-    raise NotImplementedError("call_tool is not yet implemented")
+    schema = TOOL_SCHEMAS.get(name)
+    if schema is None:
+        return {"error": f"unknown tool '{name}'"}
+    try:
+        args = json.loads(arguments_json)
+    except (TypeError, ValueError):
+        return {"error": "arguments are not valid JSON"}
+    problems = validate_json(args, schema)
+    if problems:
+        return {"error": "invalid arguments: " + "; ".join(problems)}
+    try:
+        return globals()[name](**args)
+    except Exception as exc:  # noqa: BLE001 — a tool failure is data the agent can act on
+        return {"error": f"tool '{name}' failed: {type(exc).__name__}"}

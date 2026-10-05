@@ -12,6 +12,11 @@ COPY datapack/04_evaluation ./data/04_evaluation
 COPY datapack/05_security ./data/05_security
 COPY datapack/06_templates ./data/06_templates
 COPY datapack/02_structured_data/risk_scoring_points.json ./data/02_structured_data/
+COPY datapack/02_structured_data/risk_scoring_points.json ./datapack/02_structured_data/
+COPY datapack/03_alerts ./datapack/03_alerts
+COPY datapack/04_evaluation ./datapack/04_evaluation
+COPY datapack/05_security ./datapack/05_security
+COPY datapack/06_templates ./datapack/06_templates
 ENV VERIGUARD_MODE=live PYTHONUNBUFFERED=1
 EXPOSE 8000
 CMD ["sh", "-c", "python -m veriguard.sync --week 2 && uvicorn api.app:app --host 0.0.0.0 --port 8000"]

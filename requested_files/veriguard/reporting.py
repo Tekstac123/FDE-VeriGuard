@@ -30,9 +30,54 @@ def draft_str(alert_id: str, principal: dict, trace_id: str | None = None) -> di
     Raises PermissionError for the wrong caller, ValueError when the case is not an approved escalation or the
     draft fails STR_SCHEMA. Stores the draft on the case (case["str_draft"]) and returns it.
     """
-    # TODO [W4-T1.1] authorize_tool("submit_str_draft") first. Every field in STR_SCHEMA comes from the case file, the
-    #       account (masked) and the approval decision; filing_due_by is STR_DUE_WORKING_DAYS after approval.
-    raise NotImplementedError("draft_str is not yet implemented")
+    authorize_tool(principal, "submit_str_draft")
+    case = CASES.get(alert_id)
+    if case is None:
+        raise KeyError(alert_id)
+    if case.get("recommendation") != "Escalate to Principal Officer" or case.get("hitl", {}).get("decision") != "APPROVED":
+        raise ValueError("an STR is drafted only for an escalation the Principal Officer approved")
+    approval = next(d for d in reversed(case["decisions"]) if d["decision"] == "approve")
+    summary = case["customer_summary"]
+    account = get_account((get_alert(alert_id) or {}).get("account_id", "")) or {}
+    evidence = sorted({i for t in case["typology_assessment"] for i in t["evidence_txn_ids"]})
+    from .tools import get_transactions
+    txns = [t for t in get_transactions(case["customer_id"])["transactions"] if t["txn_id"] in set(evidence)]
+    typologies = [TYPOLOGY_LABELS.get(t["typology"], t["typology"]) for t in case["typology_assessment"]]
+    grounds = (f"VeriGuard assembled case {alert_id} for customer {case['customer_id']} ({summary.get('occupation')}). "
+               f"Typologies identified: {', '.join(typologies) or 'none'}. "
+               + " ".join(f"{f['factor']} (+{f['points']}): {f['evidence']}." for f in case["risk_score"]["factors"]
+                          if f["points"] > 0)
+               + f" Case risk score {case['risk_score']['score']} ({case['risk_score']['band']}). "
+               f"Principal Officer reason: {approval['reason']}")
+    draft = {"report_ref": f"STR-DCB-2026-{alert_id[-4:]}", "case_id": alert_id,
+             "reporting_entity": "Deccan Commonwealth Bank",
+             "subject": {"customer_id": case["customer_id"], "name": summary.get("full_name"),
+                         "pan_masked": summary.get("pan_masked"),
+                         "aadhaar_masked": summary.get("aadhaar_masked") or "NOT APPLICABLE",
+                         "occupation": summary.get("occupation"), "risk_category": summary.get("risk_category")},
+             "accounts": [{"account_id": account.get("account_id"),
+                           "account_number_masked": mask_account(account.get("account_number")),
+                           "branch_code": account.get("branch_code")}],
+             "transactions_summary": {"period_from": min((t["txn_timestamp"] for t in txns), default="")[:10],
+                                      "period_to": max((t["txn_timestamp"] for t in txns), default="")[:10],
+                                      "count": len(txns), "total_value_inr": float(sum(t["amount_inr"] for t in txns)),
+                                      "key_transaction_ids": evidence[:20]},
+             "grounds_of_suspicion": grounds, "typologies": typologies,
+             "risk_score": {"score": case["risk_score"]["score"], "band": case["risk_score"]["band"],
+                            "factors": [f"{f['factor']} ({f['points']:+d}): {f['evidence']}"
+                                        for f in case["risk_score"]["factors"]]},
+             "citations": [{k: r[k] for k in ("doc_id", "version", "section")} for r in case["policy_references"]],
+             "approval": {"status": "APPROVED", "approved_by": approval["by"], "approved_at": approval["at"],
+                          "reason": approval["reason"]},
+             "ai_assistance": {"generated_by": "VeriGuard Regulatory Reporting Agent", "model": "offline-deterministic",
+                               "trace_id": trace_id or case.get("trace_id") or ""},
+             "filing_due_by": add_working_days(approval["at"], STR_DUE_WORKING_DAYS)}
+    errors = validate_json(draft, STR_SCHEMA)
+    if errors:
+        raise ValueError(f"STR draft failed its schema: {errors[:3]}")
+    case["str_draft"] = draft
+    case["next_step"] = "principal_officer_files_outside_system"
+    return draft
 
 
 def explain_case(case: dict) -> dict:
@@ -41,16 +86,50 @@ def explain_case(case: dict) -> dict:
     Returns {"alert_id", "score", "band", "recommendation", "factors", "typologies", "citations",
              "approval_trail", "threshold_note"}.
     """
-    # TODO [W4-T1.2] everything is already on the case file; APPROVAL_THRESHOLD is the line the Principal Officer cares about.
-    raise NotImplementedError("explain_case is not yet implemented")
+    factors = sorted(case["risk_score"]["factors"], key=lambda f: (-f["points"], f["factor"]))
+    score = case["risk_score"]["score"]
+    note = (f"at or above the {APPROVAL_THRESHOLD}-point threshold: Principal Officer approval required"
+            if score >= APPROVAL_THRESHOLD else f"{APPROVAL_THRESHOLD - score} points below the {APPROVAL_THRESHOLD}-point threshold")
+    return {"alert_id": case["alert_id"], "score": score, "band": case["risk_score"]["band"],
+            "recommendation": case["recommendation"],
+            "factors": [{"factor": f["factor"], "points": f["points"], "evidence": f["evidence"]} for f in factors],
+            "typologies": [{"typology": t["typology"], "evidence_txn_ids": t["evidence_txn_ids"]}
+                           for t in case["typology_assessment"]],
+            "citations": [f"{r['doc_id']} v{r['version']} §{r['section']}" for r in case["policy_references"]],
+            "approval_trail": [{k: d[k] for k in ("by", "decision", "reason", "at")} for d in case.get("decisions", [])],
+            "threshold_note": f"Score {score}/100 — {note}"}
 
 
 def compute_dashboard(cases: list[dict]) -> dict:
     """Risk-scoring dashboard: alerts by band, time to close (alert trigger → closure), HITL overrides, agent
     agreement (share of human decisions that agreed with the agent) — and one row per case linking the decision to
     its evidence and citations. No customer names or identifiers."""
-    # TODO [W4-T1.3] see the problem statement for the keys. Any rate with nothing to divide by must not crash.
-    raise NotImplementedError("compute_dashboard is not yet implemented")
+    by_band = {"Low": 0, "Medium": 0, "High": 0}
+    by_status: dict[str, int] = {}
+    hours, rows = [], []
+    decided = overrides = agree = 0
+    for c in cases:
+        by_band[c["risk_score"]["band"]] += 1
+        by_status[c["status"]] = by_status.get(c["status"], 0) + 1
+        start = c.get("alert_triggered_at") or c.get("opened_at")
+        if c.get("closed_at") and start:
+            hours.append((_dt.datetime.fromisoformat(c["closed_at"]) - _dt.datetime.fromisoformat(start))
+                         .total_seconds() / 3600)
+        decision = c.get("hitl", {}).get("decision")
+        if decision in ("APPROVED", "REJECTED"):
+            decided += 1
+            overrides += decision == "REJECTED"
+            agree += decision == "APPROVED"
+        rows.append({"alert_id": c["alert_id"], "band": c["risk_score"]["band"], "score": c["risk_score"]["score"],
+                     "recommendation": c["recommendation"], "status": c["status"], "hitl": decision,
+                     "evidence_txn_ids": sorted({i for t in c["typology_assessment"] for i in t["evidence_txn_ids"]})[:10],
+                     "citations": [f"{r['doc_id']} v{r['version']} §{r['section']}" for r in c["policy_references"]]})
+    n = len(cases)
+    return {"cases": n, "alerts_by_band": by_band, "by_status": dict(sorted(by_status.items())),
+            "pending_approvals": sum(1 for c in cases if c.get("hitl", {}).get("decision") == "PENDING"),
+            "avg_time_to_close_hours": round(sum(hours) / len(hours), 2) if hours else None,
+            "hitl_decisions": decided, "hitl_override_rate": round(overrides / decided, 3) if decided else 0.0,
+            "agent_agreement_rate": round(agree / decided, 3) if decided else None, "rows": rows}
 
 
 # ----------------------------------------------------------------------------- provided: the workflow UI

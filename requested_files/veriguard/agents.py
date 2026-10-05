@@ -132,21 +132,126 @@ def compliance_investigator(findings: dict, index) -> dict:
     findings = {"typologies": [names], "recommendation": str}. Returns {"agent", "policy_references":
     [{"finding", "doc_id", "version", "section", "page"}], "narrative": str}.
     """
-    # TODO [W2-T2.1] FINDING_QUERIES turns a finding into a question; cite policy documents only (POLICY_DOC_TYPES).
-    raise NotImplementedError("compliance_investigator is not yet implemented")
+    refs = []
+    for name in list(findings.get("typologies", [])) + [findings.get("recommendation")]:
+        query = FINDING_QUERIES.get(name)
+        if not query:
+            continue
+        hits = [h for h in hybrid_search(index, query, "Investigator", k=5) if h.get("doc_type") in POLICY_DOC_TYPES]
+        if hits:
+            h = hits[0]
+            refs.append({"finding": name, "doc_id": h["doc_id"], "version": h["version"], "section": h["section"],
+                         "page": h.get("page")})
+    narrative = " ".join(f"{r['finding']}: {r['doc_id']} v{r['version']} §{r['section']}." for r in refs)
+    return {"agent": "compliance_investigator", "policy_references": refs, "narrative": narrative}
 
 
 def investigate(alert_id: str, principal: dict, index, max_steps: int = 8) -> dict:
     """Supervisor raw agent loop: plan → route → log, iteration cap, retry once, fallback to human review; builds a
     schema-valid case file and sets the HITL checkpoint. Stored in CASES[alert_id]."""
-    # TODO [W2-T2.2] one CaseMemory per case; follow PLAN; step_log every step; stop at max_steps; a failing step is retried
-    #       once, then the case falls back to human review. The case file must pass CASE_FILE_SCHEMA. Read and
-    #       write NOTES. HITL when the recommendation is to escalate or the score is ≥ APPROVAL_THRESHOLD.
-    raise NotImplementedError("investigate is not yet implemented")
+    if not INVESTIGATOR_ROLES & set(principal.get("roles", [])):
+        raise PermissionError(f"{principal.get('user_id')} may not investigate alerts")
+    memory = CaseMemory(alert_id)
+    step_log, fallback = [], False
+    routes = {"transaction_monitoring": lambda: transaction_monitoring_agent(alert_id, memory),
+              "risk_assessment": lambda: risk_assessment_agent(alert_id, memory)}
+    queue, steps = list(PLAN), 0
+    while queue:
+        if steps >= max_steps:
+            step_log.append({"step": steps + 1, "agent": queue[0], "status": "stopped: iteration cap"})
+            fallback = True
+            break
+        agent = queue.pop(0)
+        steps += 1
+        if agent == "compliance_investigator":
+            if fallback or memory.recall("risk") is None:
+                step_log.append({"step": steps, "agent": agent, "status": "skipped: earlier step failed"})
+                continue
+            rec = recommend(memory.recall("typologies", []), memory.recall("screening", {}))
+            out = compliance_investigator({"typologies": [t["typology"] for t in memory.recall("typologies", [])],
+                                           "recommendation": rec}, index)
+            memory.remember("policy", out)
+            step_log.append({"step": steps, "agent": agent, "status": "ok"})
+            continue
+        for attempt in (1, 2):
+            try:
+                routes[agent]()
+                step_log.append({"step": steps, "agent": agent, "status": "ok" if attempt == 1 else "ok after retry"})
+                break
+            except Exception as exc:  # noqa: BLE001 — retry once, then fall back to human review
+                if attempt == 2:
+                    step_log.append({"step": steps, "agent": agent, "status": f"failed: {exc}"})
+                    fallback = True
+    customer_id = memory.recall("customer_id")
+    prior = NOTES.for_customer(customer_id) if customer_id else []
+    risk = memory.recall("risk") or {"score": 0, "band": "Low", "factors": []}
+    typologies = memory.recall("typologies", [])
+    screening = memory.recall("screening", {})
+    recommendation = "Escalate to Principal Officer" if fallback else recommend(typologies, screening)
+    hitl_required = recommendation == "Escalate to Principal Officer" or risk["score"] >= APPROVAL_THRESHOLD
+    mitigating = [f["evidence"] for f in risk["factors"] if f["factor"] == "legit_explanation_verified"]
+    if screening.get("status") == "cleared":
+        mitigating.append(f"potential match {screening['entity_id']} cleared: "
+                          f"{', '.join(screening['differing_identifiers'])} differ")
+    policy = memory.recall("policy") or {"policy_references": [], "narrative": ""}
+    rationale = (f"Score {risk['score']} ({risk['band']}); typologies: "
+                 f"{', '.join(t['typology'] for t in typologies) or 'none'}; screening: "
+                 f"{screening.get('status', 'not run')}. {policy['narrative']}"
+                 + (" Fallback: an agent step failed, routed to human review." if fallback else ""))
+    opened = now_iso()
+    case = {"alert_id": alert_id, "customer_id": customer_id, "opened_by": principal["user_id"],
+            "alert_triggered_at": (get_alert(alert_id) or {}).get("triggered_at"), "opened_at": opened,
+            "customer_summary": memory.recall("profile") or {},
+            "transactions_reviewed": memory.recall("transactions_reviewed", []),
+            "typology_assessment": [{k: t[k] for k in ("typology", "evidence_txn_ids", "confidence")} for t in typologies],
+            "risk_score": {"score": risk["score"], "band": risk["band"],
+                           "factors": [{"factor": f["factor"], "points": f["points"], "evidence": f["evidence"]}
+                                       for f in risk["factors"]]},
+            "policy_references": [{k: r[k] for k in ("doc_id", "version", "section", "page")}
+                                  for r in policy["policy_references"]],
+            "mitigating_factors": mitigating, "recommendation": recommendation, "rationale": rationale,
+            "hitl": {"required": hitl_required, "decision": "PENDING" if hitl_required else None},
+            "status": "Escalated to Principal Officer" if hitl_required else "Closed - No Further Action",
+            "decisions": [], "step_log": step_log, "prior_notes": prior, "fallback": fallback}
+    if not hitl_required:
+        case["hitl"].pop("decision")
+        case["closed_at"] = opened
+    errors = validate_json(case, CASE_FILE_SCHEMA)
+    if errors:
+        raise ValueError(f"case file failed its schema: {errors[:3]}")
+    if customer_id:
+        NOTES.add(customer_id, f"{alert_id}: {recommendation} (score {risk['score']})", principal["user_id"])
+    CASES[alert_id] = case
+    return case
 
 
 def decide(alert_id: str, principal: dict, decision: str, reason: str) -> dict:
     """Principal Officer checkpoint (DCB-POL-ESC): four-eyes, reason required, approve resumes, reject returns."""
-    # TODO [W2-T2.3] who may decide, on which case, in which state, and what is recorded are separate checks. A rejected
-    #       recommendation is never executed.
-    raise NotImplementedError("decide is not yet implemented")
+    if "PrincipalOfficer" not in principal.get("roles", []):
+        raise PermissionError(f"{principal.get('user_id')} is not the Principal Officer")
+    case = CASES.get(alert_id)
+    if case is None:
+        raise KeyError(alert_id)
+    if case["opened_by"] == principal["user_id"]:
+        raise PermissionError("four-eyes: the officer who opened the case cannot decide it")
+    if not case["hitl"].get("required") or case["hitl"].get("decision") != "PENDING":
+        raise ValueError(f"{alert_id} is not waiting for a decision")
+    if decision not in ("approve", "reject"):
+        raise ValueError("decision must be 'approve' or 'reject'")
+    if not (reason or "").strip():
+        raise ValueError("DCB-POL-ESC §2: the approver's reason must be recorded")
+    if decision == "reject":
+        case["hitl"]["decision"] = "REJECTED"
+        case["status"] = "Under Investigation"
+        case["next_step"] = "return_to_investigator"
+    else:
+        case["hitl"]["decision"] = "APPROVED"
+        if case["recommendation"] == "Escalate to Principal Officer":
+            case["next_step"] = "regulatory_reporting"
+        else:
+            case["status"] = APPROVE_CLOSE_HIGH
+            case["next_step"] = None
+            case["closed_at"] = now_iso()
+    case["hitl"]["approver"] = principal["user_id"]
+    case["decisions"].append({"by": principal["user_id"], "decision": decision, "reason": reason, "at": now_iso()})
+    return case

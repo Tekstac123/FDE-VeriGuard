@@ -55,10 +55,16 @@ class Tracer:
 def trace_step(tracer: Tracer, trace_id: str, parent_span_id: str, agent_name: str, input_tokens: int,
                output_tokens: int, latency_ms: float, status: str = "ok") -> dict:
     """One child span of the investigation trace, with GenAI semantic-convention attributes and its cost."""
-    # TODO [W4-T2.1] span keys trace_id, span_id, parent_span_id, name, attributes (gen_ai.operation.name,
-    #       gen_ai.agent.name, gen_ai.usage.input_tokens/output_tokens, gen_ai.response.finish_reasons,
-    #       veriguard.latency_ms, veriguard.cost_usd, veriguard.status). Input and output tokens are priced apart.
-    raise NotImplementedError("trace_step is not yet implemented")
+    cost = round(input_tokens / 1000 * tracer.price_in + output_tokens / 1000 * tracer.price_out, 6)
+    span_id = hashlib.sha256(f"{trace_id}:{len(tracer.spans)}:{agent_name}".encode()).hexdigest()[:16]
+    span = {"trace_id": trace_id, "span_id": span_id, "parent_span_id": parent_span_id,
+            "name": f"veriguard.agent.{agent_name}",
+            "attributes": {"gen_ai.operation.name": "invoke_agent", "gen_ai.agent.name": agent_name,
+                           "gen_ai.usage.input_tokens": input_tokens, "gen_ai.usage.output_tokens": output_tokens,
+                           "gen_ai.response.finish_reasons": [status], "veriguard.latency_ms": latency_ms,
+                           "veriguard.cost_usd": cost, "veriguard.status": status}}
+    tracer.spans.append(span)
+    return span
 
 
 class BudgetGuard:
@@ -70,18 +76,15 @@ class BudgetGuard:
 
     def allow(self, estimate_usd: float) -> bool:
         """True when spending estimate_usd now would not take the investigation over the limit (0 = no cap)."""
-        # TODO [W4-T2.2] check before the money is spent.
-        raise NotImplementedError("BudgetGuard.allow is not yet implemented")
+        return self.limit_usd <= 0 or self.spent + estimate_usd <= self.limit_usd + 1e-12
 
     def charge(self, actual_usd: float) -> None:
         """Record money actually spent."""
-        # TODO [W4-T2.2] keep a running total.
-        raise NotImplementedError("BudgetGuard.charge is not yet implemented")
+        self.spent += actual_usd
 
     def remaining(self) -> float:
         """Budget left (never below 0); 0.0 when there is no cap."""
-        # TODO [W4-T2.2] limit minus what is spent.
-        raise NotImplementedError("BudgetGuard.remaining is not yet implemented")
+        return 0.0 if self.limit_usd <= 0 else round(max(0.0, self.limit_usd - self.spent), 6)
 
 
 def error_analysis(outputs: list[dict], labels: list[dict]) -> dict:
@@ -90,9 +93,46 @@ def error_analysis(outputs: list[dict], labels: list[dict]) -> dict:
     Returns {"alerts", "disposition_accuracy", "score_accuracy", "band_accuracy", "escalation_precision",
              "escalation_recall", "taxonomy": {mode: [alert_ids]}, "top_failure_modes": [(mode, count)]}.
     """
-    # TODO [W4-T2.3] the failure-mode names are in the problem statement. Decide for each mismatch whether the system or
-    #       the label is wrong — that is the analysis; this function only finds and counts them.
-    raise NotImplementedError("error_analysis is not yet implemented")
+    by_id = {o["alert_id"]: o for o in outputs}
+    taxonomy: dict[str, list[str]] = {}
+    hits = {"disposition": 0, "score": 0, "band": 0}
+    tp = fp = fn = 0
+    for lab in labels:
+        out = by_id.get(lab["alert_id"])
+        if out is None:
+            taxonomy.setdefault("not_investigated", []).append(lab["alert_id"])
+            continue
+        aid = lab["alert_id"]
+        want_esc = lab["expected_disposition"].startswith("Escalate")
+        got_esc = out["recommendation"].startswith("Escalate")
+        tp, fp, fn = tp + (want_esc and got_esc), fp + (got_esc and not want_esc), fn + (want_esc and not got_esc)
+        if out["recommendation"] == lab["expected_disposition"]:
+            hits["disposition"] += 1
+        elif want_esc == got_esc:
+            taxonomy.setdefault("close_reason_mismatch", []).append(aid)
+        else:
+            taxonomy.setdefault("missed_escalation" if want_esc else "false_escalation", []).append(aid)
+        hits["score"] += out["risk_score"]["score"] == int(lab["expected_risk_score"])
+        hits["band"] += out["risk_score"]["band"] == lab["expected_risk_band"]
+        want_f = {f.replace("round-tripping", "round_tripping") for f in lab["score_factors"].split(";") if f}
+        got_f = {f["factor"] for f in out["risk_score"]["factors"]}
+        for f in sorted(want_f - got_f):
+            taxonomy.setdefault(f"factor_missed:{f}", []).append(aid)
+        for f in sorted(got_f - want_f):
+            taxonomy.setdefault(f"factor_extra:{f}", []).append(aid)
+        want_t = {x for x in lab["expected_typologies"].split(";") if x and x != "None"}
+        got_t = {TYPOLOGY_LABELS.get(t["typology"], t["typology"]) for t in out["typology_assessment"]}
+        for t in sorted(want_t - got_t):
+            taxonomy.setdefault(f"typology_missed:{t}", []).append(aid)
+        for t in sorted(got_t - want_t):
+            taxonomy.setdefault(f"typology_extra:{t}", []).append(aid)
+    n = len(labels) or 1
+    ranked = sorted(((m, len(ids)) for m, ids in taxonomy.items()), key=lambda x: (-x[1], x[0]))
+    return {"alerts": len(labels), "disposition_accuracy": round(hits["disposition"] / n, 3),
+            "score_accuracy": round(hits["score"] / n, 3), "band_accuracy": round(hits["band"] / n, 3),
+            "escalation_precision": round(tp / (tp + fp), 3) if tp + fp else 0.0,
+            "escalation_recall": round(tp / (tp + fn), 3) if tp + fn else 0.0,
+            "taxonomy": taxonomy, "top_failure_modes": ranked[:3]}
 
 
 # ----------------------------------------------------------------------------- provided: the traced workflow

@@ -43,8 +43,8 @@ server = MCPServer("veriguard-compliance-tools", instructions=(
     "DCB VeriGuard compliance tools. Numbers come from these tools, never from the model. All outputs are masked."))
 
 
-def _call(name: str, **arguments) -> dict:
-    return call_tool(name, json.dumps({k: v for k, v in arguments.items() if v is not None}))
+def _call(tool_name: str, **arguments) -> dict:
+    return call_tool(tool_name, json.dumps({k: v for k, v in arguments.items() if v is not None}))
 
 
 @server.tool(description="Transactions of a customer (read-only, txn-db). Dates are YYYY-MM-DD.")

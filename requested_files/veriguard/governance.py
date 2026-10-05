@@ -57,39 +57,87 @@ def mask_strings(obj):
     return obj
 
 
-# TODO [W3-T3.5] (data task — no code here) extend datapack/05_security/attack_set.jsonl: append at least 10 attacks of your own
-#   (attack_id "RT-041", "RT-042", …) with the same fields as the 40 provided — attack_id, category, user_role, prompt,
-#   expected_safe_behavior, severity — across several categories. Keep RT-001 … RT-040 unchanged.
-
-
 # ----------------------------------------------------------------------------- Task 2 — you implement
 def verify_chain(entries: list[dict]) -> tuple[bool, int | None]:
     """(True, None) when every entry links to the previous hash and its own hash matches; else (False, first bad seq)."""
-    # TODO [W3-T3.1] walk from GENESIS; entry_hash recomputes what each stored hash should be.
-    raise NotImplementedError("verify_chain is not yet implemented")
+    prev = GENESIS
+    for position, entry in enumerate(entries, start=1):
+        if entry.get("seq") != position or entry.get("prev_hash") != prev or entry.get("hash") != entry_hash(entry):
+            return False, entry.get("seq", position)
+        prev = entry["hash"]
+    return True, None
 
 
 def secure_ask(index, question: str, principal: dict, audit: AuditLog) -> dict:
     """The governed Q&A path: authorise → guard (mask + shields) → role-trimmed retrieval → quarantine poisoned
     sections → answer → mask the output → audit the prompt and the response. Returns the answer dict + "flags"."""
-    # TODO [W3-T3.2] authorize_tool("search_documents"), guard_input, retrieval_text, looks_like_injection and
-    #       index_without are your building blocks; a blocked prompt never reaches retrieval. A live index has
-    #       index.for_role(role): use it so the role filter also runs inside Azure AI Search.
-    raise NotImplementedError("secure_ask is not yet implemented")
+    authorize_tool(principal, "search_documents")
+    role = principal["roles"][0]
+    guard = guard_input(question)
+    flags = list(guard["reasons"])
+    audit.append("prompt", principal, {"text": guard["text"], "reasons": guard["reasons"]})
+    if guard["blocked"]:
+        result = {"answer": NO_DOCS, "citations": [], "sources": [], "refused": True, "superseded_note": None,
+                  "flags": ["blocked"] + flags}
+        audit.append("response", principal, {"outcome": "blocked", "flags": result["flags"]})
+        return result
+    if hasattr(index, "for_role"):            # live: the role filter also runs inside Azure AI Search
+        index = index.for_role(role)
+    query = retrieval_text(guard["text"])
+    hits = hybrid_search(index, query, role, k=5)
+    poisoned = [h for h in hits if looks_like_injection(h.get("text", ""))]
+    if poisoned:
+        flags.append("indirect_injection_blocked")
+        index = index_without(index, {h["id"] for h in poisoned})
+    ans = answer_question(index, query, role)
+    answer = mask_pii(ans["answer"])["text"]
+    if poisoned:
+        answer += ("\nSecurity note: " + ", ".join(sorted({f"{h['doc_id']} §{h['section']}" for h in poisoned}))
+                   + " contains embedded instructions aimed at AI systems; they were not followed and that section was "
+                   "quarantined.")
+    result = {**ans, "answer": answer, "flags": flags}
+    audit.append("response", principal, {"outcome": "refused" if ans["refused"] else "answered", "answer": answer,
+                                         "citations": ans["citations"], "flags": flags,
+                                         "quarantined": sorted(h["id"] for h in poisoned)})
+    return result
 
 
 def secure_tool_call(principal: dict, tool: str, arguments: dict, audit: AuditLog, context: dict | None = None) -> dict:
     """On-behalf-of tool call: the CALLER's permission is checked, outputs are masked, every call is audited.
     Returns {"allowed": False, "error": ...} when denied, else {"allowed": True, "condition", ...tool output}."""
-    # TODO [W3-T3.3] authorize_tool decides; data tools run through call_tool; mask_strings masks the output.
-    raise NotImplementedError("secure_tool_call is not yet implemented")
+    try:
+        condition = authorize_tool(principal, tool, context)
+    except PermissionError as exc:
+        audit.append("tool_call", principal, {"tool": tool, "arguments": mask_strings(arguments), "outcome": "denied",
+                                              "reason": str(exc)})
+        return {"allowed": False, "error": f"permission denied: {exc}"}
+    if tool in TOOL_SCHEMAS:
+        out = mask_strings(call_tool(tool, json.dumps(arguments)))
+    else:
+        out = {"tool": tool, "arguments": arguments}
+    audit.append("tool_call", principal, {"tool": tool, "arguments": mask_strings(arguments), "outcome": "allowed",
+                                          "condition": condition})
+    return {"allowed": True, "condition": condition, **out}
 
 
 def quality_gate(metrics: dict, baseline: dict | None = None) -> dict:
     """CI evaluation gate: PROMOTE only when every bar is met, the zero-metrics are 0, nothing is missing and no
     metric regressed by more than REGRESSION_TOLERANCE against the baseline; otherwise BLOCK with reasons."""
-    # TODO [W3-T3.4] GATE_BARS, ZERO_METRICS and REGRESSION_TOLERANCE are the release rules.
-    raise NotImplementedError("quality_gate is not yet implemented")
+    reasons = []
+    for name, bar in GATE_BARS.items():
+        if name not in metrics:
+            reasons.append(f"{name} is missing")
+        elif metrics[name] < bar:
+            reasons.append(f"{name} {metrics[name]} below {bar}")
+    for name in ZERO_METRICS:
+        if name not in metrics:
+            reasons.append(f"{name} is missing")
+        elif metrics[name] != 0:
+            reasons.append(f"{name} must be 0, got {metrics[name]}")
+    for name, before in (baseline or {}).items():
+        if name in GATE_BARS and name in metrics and metrics[name] < before - REGRESSION_TOLERANCE:
+            reasons.append(f"{name} regressed from {before} to {metrics[name]}")
+    return {"decision": "BLOCK" if reasons else "PROMOTE", "reasons": reasons}
 
 
 # ----------------------------------------------------------------------------- provided: the M3 test runners

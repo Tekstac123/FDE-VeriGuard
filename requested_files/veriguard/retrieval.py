@@ -21,15 +21,9 @@ RERANK_CANDIDATES = 50
 
 def is_allowed(chunk: dict, role: str) -> bool:
     """Security trimming: the chunk is current AND the role is in its access_roles. Unknown role → PermissionError."""
-    # TODO [W1-T2.1] is_allowed — the security-trimming rule every search result must pass.
-    #   What to do:
-    #   1. If `role` is not one of ROLES ("Analyst", "Investigator", "Auditor", "PrincipalOfficer", "Admin"),
-    #      raise PermissionError (an unknown role is never "just denied" — it is an error).
-    #   2. Return True ONLY when chunk["status"] == "current" AND role is in chunk["access_roles"].
-    #      A missing status or missing/empty access_roles → False. Superseded chunks → False for every role.
-    #   Expected: Analyst on a Confidential chunk (Investigator;Auditor;PrincipalOfficer) → False;
-    #             Auditor on DCB-IA-2026-06 → True; any role on DCB-POL-KYC v3.2 → False; role "CFO" → PermissionError.
-    raise NotImplementedError("is_allowed is not yet implemented")
+    if role not in ROLES:
+        raise PermissionError(f"unknown role {role!r}")
+    return chunk.get("status") == "current" and role in (chunk.get("access_roles") or [])
 
 
 def hybrid_search(index: SearchIndex, query: str, role: str, k: int = 5, mode: str = "hybrid_rerank") -> list[dict]:
@@ -37,23 +31,23 @@ def hybrid_search(index: SearchIndex, query: str, role: str, k: int = 5, mode: s
 
     Results are copies of the chunks plus 'score', 'keyword_score', 'vector_score' (+ 'rerank_score').
     """
-    # TODO [W1-T2.2] hybrid_search — role-trimmed hybrid retrieval with three modes (for the ablation).
-    #   What to do:
-    #   1. mode not in MODES → raise ValueError.
-    #   2. kw = index.keyword_scores(query) (BM25) and vec = index.vector_scores(query) (cosine) — one score per
-    #      index.chunks position.
-    #   3. FILTER FIRST: keep only chunk positions i where is_allowed(index.chunks[i], role). Never rank the others.
-    #   4. Build each ranking separately over the allowed positions:
-    #        vector ranking  = positions with vec[i] >= MIN_SIMILARITY, sorted by vec desc (ties: lower i first)
-    #        keyword ranking = positions with kw[i] > 0, sorted by kw desc (ties: lower i first) — NOT in "vector" mode
-    #   5. Reciprocal Rank Fusion: score[i] = Σ over the rankings of 1 / (RRF_K + rank), rank starting at 1.
-    #      Order by fused score desc (ties: lower i first).
-    #   6. Results = copies of the chunks: {**chunk, "score": round(fused, 6), "keyword_score": kw[i],
-    #      "vector_score": vec[i]}. Take the top k — or, for "hybrid_rerank", the top RERANK_CANDIDATES, pass them
-    #      to index.rerank(query, results) (adds "rerank_score", reorders) and then take the top k.
-    #   Expected: the Analyst never receives DCB-IA-2026-06 or any superseded chunk, even with k=50;
-    #             Recall@5 in the ablation: vector < hybrid ≈ hybrid_rerank.
-    raise NotImplementedError("hybrid_search is not yet implemented")
+    if mode not in MODES:
+        raise ValueError(f"mode must be one of {MODES}")
+    kw, vec = index.keyword_scores(query), index.vector_scores(query)
+    allowed = [i for i, c in enumerate(index.chunks) if is_allowed(c, role)]
+    rankings = [sorted((i for i in allowed if vec[i] >= MIN_SIMILARITY), key=lambda i: (-vec[i], i))]
+    if mode != "vector":
+        rankings.append(sorted((i for i in allowed if kw[i] > 0), key=lambda i: (-kw[i], i)))
+    fused: dict[int, float] = {}
+    for ranking in rankings:
+        for rank, i in enumerate(ranking, start=1):
+            fused[i] = fused.get(i, 0.0) + 1.0 / (RRF_K + rank)
+    order = sorted(fused, key=lambda i: (-fused[i], i))
+    results = [{**index.chunks[i], "score": round(fused[i], 6), "keyword_score": kw[i], "vector_score": vec[i]}
+               for i in order[:RERANK_CANDIDATES if mode == "hybrid_rerank" else k]]
+    if mode == "hybrid_rerank":
+        results = index.rerank(query, results)
+    return results[:k]
 
 
 def answer_question(index: SearchIndex, question: str, role: str) -> dict:
@@ -62,56 +56,60 @@ def answer_question(index: SearchIndex, question: str, role: str) -> dict:
     Returns {"answer", "citations": [{"doc_id", "version", "section", "page"}], "sources", "refused",
     "superseded_note"}.
     """
-    # TODO [W1-T2.3] answer_question — the citation / decline contract VeriGuard answers with.
-    #   What to do:
-    #   1. results = hybrid_search(index, question, role, k=5, mode="hybrid_rerank").
-    #   2. DECLINE (before any model call) when there are no results, or when no result has
-    #      index.coverage(question, r) >= MIN_COVERAGE. Return
-    #      {"answer": NO_DOCS, "citations": [], "sources": [], "refused": True, "superseded_note": None}.
-    #   3. cited = [results[0]] + the runner-up results[1] ONLY if it also has coverage >= MIN_COVERAGE.
-    #   4. Superseded note: for each distinct doc_id in cited, for every row in superseded_versions(doc_id), add
-    #      f"{doc_id} v{old['version']} is superseded by v{current}; this answer uses v{current}."
-    #      (current = that doc's version in cited). Join the notes with spaces; no notes → None.
-    #   5. answer = compose_answer(question, cited) + f" [{top['doc_id']} v{top['version']} §{top['section']}]"
-    #      — compose_answer sends the cited sections to the LLM gateway (VERIGUARD_LLM=gateway, key from .env)
-    #        and falls back to the extractive answer; you MUST call it, never the model directly.
-    #      If there is a note: answer += "\nNote: " + note. Always end with "\n\nSources: " + "; ".join(source_line(c)).
-    #   6. Return {"answer", "citations": [citation_of(c) for c in cited], "sources": [source_line(c) ...],
-    #      "refused": False, "superseded_note": note}.
-    #   Expected: "What single cash deposit amount triggers an internal monitoring alert at DCB?" (Analyst) →
-    #             Rs 3,00,000, top citation DCB-POL-KYC v4.0 §6 p.2, note "DCB-POL-KYC v3.2 is superseded by v4.0…";
-    #             the crypto-threshold question → declined with NO_DOCS.
-    raise NotImplementedError("answer_question is not yet implemented")
+    results = hybrid_search(index, question, role, k=5, mode="hybrid_rerank")
+    if not results or max(index.coverage(question, r) for r in results) < MIN_COVERAGE:
+        return {"answer": NO_DOCS, "citations": [], "sources": [], "refused": True, "superseded_note": None}
+    cited = [results[0]] + [r for r in results[1:2] if index.coverage(question, r) >= MIN_COVERAGE]
+    top = cited[0]
+    notes = []
+    for doc_id in dict.fromkeys(c["doc_id"] for c in cited):
+        current = next(c["version"] for c in cited if c["doc_id"] == doc_id)
+        for old in superseded_versions(doc_id):
+            notes.append(f"{doc_id} v{old['version']} is superseded by v{current}; this answer uses v{current}.")
+    note = " ".join(notes) or None
+    answer = f"{compose_answer(question, cited)} [{top['doc_id']} v{top['version']} §{top['section']}]"
+    if note:
+        answer += f"\nNote: {note}"
+    answer += "\n\nSources: " + "; ".join(source_line(c) for c in cited)
+    return {"answer": answer, "citations": [citation_of(c) for c in cited], "sources": [source_line(c) for c in cited],
+            "refused": False, "superseded_note": note}
 
 
 def evaluate_qa(index: SearchIndex, golden: list[dict], k: int = 5, mode: str = "hybrid_rerank") -> dict:
     """M1 metrics: Recall@k and citation accuracy (answerable items), decline rate (unanswerable), superseded-trap
     accuracy, groundedness (answered items) and leaks (restricted items). Returns the metrics plus "items"."""
-    # TODO [W1-T3.1] evaluate_qa — measure the pipeline on the golden set (the M1 evidence).
-    #   What to do, for every item (fields: qid, question_type, role, question, expected_*):
-    #   1. expected = expected_citations(item) → {(doc_id, version, section), …}.
-    #   2. hits = hybrid_search(index, item["question"], item["role"], k=4*k, mode=mode);
-    #      retrieved = the first k UNIQUE doc_ids of hits (keep order).
-    #   3. ans = answer_question(index, item["question"], item["role"]).
-    #   4. row = {"qid", "type": question_type, "role", "retrieved", "refused": ans["refused"], "citations"} plus:
-    #      unanswerable    → row["declined"] = ans["refused"]
-    #      restricted      → row["leaked"] = sorted expected doc_ids that appear in retrieved OR in ans citations;
-    #                        add len(row["leaked"]) to the leak total
-    #      every other type (factual, multi_hop, superseded_trap):
-    #                        row["recall"] = |expected doc_ids ∩ retrieved| / |expected doc_ids|  (0.0 if none)
-    #                        row["citation_ok"] = not refused AND any (doc_id, version, section) of a citation is in expected
-    #                        if answered: row["groundedness"] = groundedness(ans["answer"], <index.chunks matching the
-    #                                     citations' doc_id + version + section>)
-    #                        superseded_trap also: row["superseded_ok"] = citation_ok AND bool(ans["superseded_note"])
-    #   5. Return {"k", "mode", "recall_at_k", "citation_accuracy", "decline_rate", "superseded_accuracy",
-    #      "groundedness"  (each = mean over the rows that HAVE that key, rounded to 3 decimals, 0.0 if none),
-    #      "leaks": total, "items": rows}.
-    #   M1 bar (python run_week1.py): Recall@5 ≥ 0.80 · citation ≥ 0.90 · decline ≥ 0.80 · superseded 1.0 ·
-    #   groundedness ≥ 4.0 · leaks 0.
-    #
-    # TODO [W1-T3.2] (data task — no code here) extend datapack/04_evaluation/golden_dataset.jsonl:
-    #   append ≥ 10 new JSON lines (qid "GQ-031", "GQ-032", …) with the same 8 fields as the seed — qid,
-    #   question_type, role, question, reference_answer, expected_doc_ids, expected_versions, expected_sections —
-    #   including ≥ 3 "unanswerable" (expected_* = "") and ≥ 3 "superseded_trap" (DCB-POL-KYC v3.2 → v4.0,
-    #   DCB-POL-RET v1.0 → v2.0). Expected citations must point at CURRENT versions. Keep GQ-001 … GQ-030 unchanged.
-    raise NotImplementedError("evaluate_qa is not yet implemented")
+    rows, leaks = [], 0
+    for item in golden:
+        role, kind = item["role"], item["question_type"]
+        expected = expected_citations(item)
+        hits = hybrid_search(index, item["question"], role, k=4 * k, mode=mode)
+        retrieved = list(dict.fromkeys(h["doc_id"] for h in hits))[:k]
+        ans = answer_question(index, item["question"], role)
+        row = {"qid": item["qid"], "type": kind, "role": role, "retrieved": retrieved, "refused": ans["refused"],
+               "citations": ans["citations"]}
+        if kind == "unanswerable":
+            row["declined"] = ans["refused"]
+        elif kind == "restricted":     # safe = nothing from the restricted target is retrieved or cited
+            targets = {e[0] for e in expected}
+            row["leaked"] = sorted({d for d in retrieved if d in targets} | {c["doc_id"] for c in ans["citations"]
+                                                                            if c["doc_id"] in targets})
+            leaks += len(row["leaked"])
+        else:
+            docs = {e[0] for e in expected}
+            row["recall"] = len(docs & set(retrieved)) / len(docs) if docs else 0.0
+            row["citation_ok"] = (not ans["refused"]) and any(
+                (c["doc_id"], c["version"], c["section"]) in expected for c in ans["citations"])
+            if not ans["refused"]:
+                cited = [h for h in index.chunks if any(h["doc_id"] == c["doc_id"] and h["version"] == c["version"]
+                                                        and h["section"] == c["section"] for c in ans["citations"])]
+                row["groundedness"] = groundedness(ans["answer"], cited)
+            if kind == "superseded_trap":
+                row["superseded_ok"] = row["citation_ok"] and bool(ans["superseded_note"])
+        rows.append(row)
+
+    def mean(key, subset):
+        vals = [r[key] for r in subset if key in r]
+        return round(sum(vals) / len(vals), 3) if vals else 0.0
+    return {"k": k, "mode": mode, "recall_at_k": mean("recall", rows), "citation_accuracy": mean("citation_ok", rows),
+            "decline_rate": mean("declined", rows), "superseded_accuracy": mean("superseded_ok", rows),
+            "groundedness": mean("groundedness", rows), "leaks": leaks, "items": rows}
